@@ -35,6 +35,9 @@ This design ensures:
 
 ## Installation
 
+This project requires **Python 3.10+, recommended: Python 3.12.x**  
+It is tested and developed with **Python 3.12.3**.
+
 ```bash
   cp .env.example .env
 ````
