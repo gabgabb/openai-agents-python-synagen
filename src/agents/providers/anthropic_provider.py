@@ -1,11 +1,9 @@
-import os
-import json
 import base64
-import requests
-import anthropic
-import pymupdf
+import json
+import os
+from typing import List, Dict, Optional
 from urllib.parse import urlparse
-from typing import List, Dict, Optional, Union
+import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,27 +30,60 @@ SYSTEM_PROMPT = (
     "Write in complete, professional sentences suitable for a clinical or academic audience."
 )
 
-# Function to extract text from a PDF file
-def extract_text_from_pdf_path(path: str) -> str:
-    with pymupdf.open(path) as doc:
-        return "\n".join(page.get_text() for page in doc)
+def to_dict(obj):
+    """
+    Convert an object to a dictionary if it has a dict() method, otherwise return the object itself.
+    :param obj:
+    :return: dict or object
+    """
+    return obj.dict() if hasattr(obj, "dict") else obj
 
-# Function to extract text from a PDF file at a URL
-def extract_text_from_pdf_url(url: str) -> str:
-    response = requests.get(url)
-    response.raise_for_status()
-    with open("temp.pdf", "wb") as f:
-        f.write(response.content)
-    return extract_text_from_pdf_path("temp.pdf")
+def resolve_source(raw_data: str) -> Dict:
+    """
+    Resolve the source of the document data, determining if it's a URL, a file path, or base64 encoded data.
+    :param raw_data:
+    :return: dict
+    """
+    parsed = urlparse(raw_data)
+    is_url = parsed.scheme in ["http", "https"] and raw_data.lower().endswith(".pdf")
+    is_pdf_path = raw_data.lower().endswith(".pdf") and os.path.isfile(raw_data)
+
+    if is_url:
+        return {"type": "url", "url": raw_data}
+    elif is_pdf_path:
+        with open(raw_data, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": encoded
+        }
+    elif len(raw_data) > 1000 and not raw_data.startswith(" "):  # crude base64
+        return {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": raw_data
+        }
+    else:
+        return {
+            "type": "text",
+            "media_type": "text/plain",
+            "data": raw_data.strip()
+        }
 
 def ask_with_citations(
     question: str,
     documents: List[Dict[str, str]],
     model: str = "claude-3-5-sonnet-latest",
     with_raw_response: bool = False
-) -> None:
+) -> str:
     """
     Send a question to the Claude model with provided documents and return the response.
+    :param question: The question to ask.
+    :param documents: List of documents to provide as context.
+    :param model: The model to use (default is "claude-3-5-sonnet-latest").
+    :param with_raw_response: Whether to include the raw response for debugging.
+    :return: The formatted response from the model.
     """
     content_blocks = []
     documents = [doc for doc in documents if doc.get("data", "").strip()]
@@ -67,43 +98,13 @@ def ask_with_citations(
         index_to_title[i] = title
 
         try:
-            if isinstance(raw_data, str):
-                parsed = urlparse(raw_data)
-                is_url = parsed.scheme in ["http", "https"] and raw_data.lower().endswith(".pdf")
-                is_pdf_path = raw_data.lower().endswith(".pdf") and os.path.isfile(raw_data)
-                is_base64_pdf = False
-
-                if is_url:
-                    source = {"type": "url", "url": raw_data}
-                elif is_pdf_path:
-                    with open(raw_data, "rb") as f:
-                        encoded = base64.b64encode(f.read()).decode("utf-8")
-                    source = {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": encoded
-                    }
-                elif len(raw_data) > 1000 and not raw_data.startswith(" "):  # crude base64 PDF check
-                    source = {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": raw_data
-                    }
-                else:
-                    text_data = raw_data.strip()
-                    source = {
-                        "type": "text",
-                        "media_type": "text/plain",
-                        "data": text_data
-                    }
-            else:
-                continue
+            source = resolve_source(raw_data)
 
             document_block = {
                 "type": "document",
                 "source": source,
                 "title": doc["title"],
-                "context": doc.get("context", "Context: medical reference document."),
+                "context": doc.get("context") or "No specific context provided.",
                 "citations": {"enabled": True},
             }
 
@@ -142,10 +143,16 @@ def ask_with_citations(
         print("\n" + "=" * 80)
         print("Formatted Response:\n" + "=" * 80)
 
-    return print_annotated_response(response, index_to_title)
+    return format_annotated_response(response, index_to_title)
 
-# Function to format the raw response only for debugging
-def raw_response(response: anthropic.types.Message) -> str:
+def raw_response(
+    response: anthropic.types.Message
+) -> str:
+    """
+    Format the raw response from the Claude model for debugging purposes.
+    :param response:
+    :return:
+    """
     raw_blocks = []
     for block in response.content:
         if block.type == "text":
@@ -165,13 +172,15 @@ def raw_response(response: anthropic.types.Message) -> str:
 
     return json.dumps({"content": raw_blocks}, indent=2)
 
-# Function to print the annotated response
-def print_annotated_response(
+def format_annotated_response(
     response: anthropic.types.Message,
     index_to_title: Optional[Dict[int, str]] = None
-) -> None:
+) -> str:
     """
-    Reconstructs and prints Claude's response with inline citations and supporting quotes.
+    Format the response from the Claude model, including citations and token usage.
+    :param response:
+    :param index_to_title:
+    :return: str
     """
     answer = ""
     citation_bank = []
@@ -187,13 +196,13 @@ def print_annotated_response(
             else:
                 answer += f"{text} "
 
-    print("Answer:\n" + answer.strip())
+    output = "Answer:\n" + answer.strip()
 
     if citation_bank:
-        print("\nQuotes:")
+        output += "\n\nQuotes:"
         for i, ref_group in enumerate(citation_bank, 1):
             for ref in ref_group:
-                ref_dict = ref.dict() if hasattr(ref, "dict") else ref
+                ref_dict = to_dict(ref)
                 cited_text = ref_dict.get("cited_text", "—").strip()
                 title = (
                     ref_dict.get("document_title")
@@ -204,7 +213,11 @@ def print_annotated_response(
                         else "Unknown"
                     )
                 )
-                print(f"[{i}] \"{cited_text}\" – {title}")
+                output += f"\n[{i}] \"{cited_text}\" – {title}"
 
-    print(f"\n🔢 Tokens used: input={response.usage.input_tokens}, output={response.usage.output_tokens}")
+    output += (
+        f"\n\n🔢 Tokens used: input={response.usage.input_tokens}, "
+        f"output={response.usage.output_tokens}"
+    )
 
+    return output
