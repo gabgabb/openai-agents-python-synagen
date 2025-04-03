@@ -1,11 +1,13 @@
 import os
-import anthropic
 import json
-import pymupdf
+import base64
 import requests
+import anthropic
+import pymupdf
 from urllib.parse import urlparse
-
+from typing import List, Dict, Optional, Union
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # Initialize the Anthropics client
@@ -13,7 +15,7 @@ client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY")
 )
 
-# Prompt for the Claude model
+# System prompt for the Claude model
 SYSTEM_PROMPT = (
     "You are an expert research assistant. You will be provided with one or more documents and a question.\n"
     "Your task is to answer the question clearly and concisely using evidence from the documents.\n"
@@ -31,19 +33,24 @@ SYSTEM_PROMPT = (
 )
 
 # Function to extract text from a PDF file
-def extract_text_from_pdf_path(path):
+def extract_text_from_pdf_path(path: str) -> str:
     with pymupdf.open(path) as doc:
         return "\n".join(page.get_text() for page in doc)
 
 # Function to extract text from a PDF file at a URL
-def extract_text_from_pdf_url(url):
+def extract_text_from_pdf_url(url: str) -> str:
     response = requests.get(url)
     response.raise_for_status()
     with open("temp.pdf", "wb") as f:
         f.write(response.content)
     return extract_text_from_pdf_path("temp.pdf")
 
-def ask_with_citations(question, documents, model="claude-3-5-sonnet-latest", with_raw_response=False):
+def ask_with_citations(
+    question: str,
+    documents: List[Dict[str, str]],
+    model: str = "claude-3-5-sonnet-latest",
+    with_raw_response: bool = False
+) -> None:
     """
     Send a question to the Claude model with provided documents and return the response.
     """
@@ -61,69 +68,56 @@ def ask_with_citations(question, documents, model="claude-3-5-sonnet-latest", wi
 
         try:
             if isinstance(raw_data, str):
-                # Local PDF
-                if raw_data.lower().endswith(".pdf") and os.path.isfile(raw_data):
-                    text_data = extract_text_from_pdf_path(raw_data)
+                parsed = urlparse(raw_data)
+                is_url = parsed.scheme in ["http", "https"] and raw_data.lower().endswith(".pdf")
+                is_pdf_path = raw_data.lower().endswith(".pdf") and os.path.isfile(raw_data)
+                is_base64_pdf = False
 
-                # Online PDF
-                elif raw_data.lower().endswith(".pdf") and urlparse(raw_data).scheme in ["http", "https"]:
-                    text_data = extract_text_from_pdf_url(raw_data)
-
-                # Brut text
+                if is_url:
+                    source = {"type": "url", "url": raw_data}
+                elif is_pdf_path:
+                    with open(raw_data, "rb") as f:
+                        encoded = base64.b64encode(f.read()).decode("utf-8")
+                    source = {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": encoded
+                    }
+                elif len(raw_data) > 1000 and not raw_data.startswith(" "):  # crude base64 PDF check
+                    source = {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": raw_data
+                    }
                 else:
                     text_data = raw_data.strip()
+                    source = {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": text_data
+                    }
             else:
-                continue  # Skip non-str data
+                continue
+
+            document_block = {
+                "type": "document",
+                "source": source,
+                "title": doc["title"],
+                "context": doc.get("context", "Context: medical reference document."),
+                "citations": {"enabled": True},
+            }
+
+            if source["type"] in ["base64", "url"]:
+                document_block["cache_control"] = {"type": "ephemeral"}
+
+            content_blocks.append(document_block)
 
         except Exception as e:
-            print(f"[Warning] Failed to extract '{title}': {e}")
+            print(f"[Warning] Failed to process document '{title}': {e}")
             continue
 
-        if not text_data.strip():
-            continue
-
-        is_pdf = (
-            raw_data.lower().endswith(".pdf")
-            or (doc.get("media_type") == "application/pdf")
-        )
-
-        parsed = urlparse(raw_data)
-        is_url = parsed.scheme in ["http", "https"]
-        is_pdf = raw_data.lower().endswith(".pdf")
-
-        # Gestion des différents formats
-        if is_url and is_pdf:
-            source = {
-                "type": "url",
-                "url": raw_data
-            }
-        elif is_pdf and os.path.isfile(raw_data):
-            text_data = extract_text_from_pdf_path(raw_data)
-            source = {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": text_data
-            }
-        else:
-            text_data = raw_data.strip()
-            source = {
-                "type": "text",
-                "media_type": "text/plain",
-                "data": text_data
-            }
-
-        document_block = {
-            "type": "document",
-            "source": source,
-            "title": doc["title"],
-            "context": doc.get("context", "Context: medical reference document."),
-            "citations": {"enabled": True},
-        }
-
-        if is_pdf or is_url:
-            document_block["cache_control"] = {"type": "ephemeral"}
-
-        content_blocks.append(document_block)
+    if not content_blocks:
+        raise ValueError("No valid documents to send.")
 
     content_blocks.append({
         "type": "text",
@@ -132,8 +126,8 @@ def ask_with_citations(question, documents, model="claude-3-5-sonnet-latest", wi
 
     response = client.messages.create(
         model=model,
-        temperature=0.0,
         system=SYSTEM_PROMPT,
+        temperature=0.0,
         messages=[{
             "role": "user",
             "content": content_blocks
@@ -142,19 +136,16 @@ def ask_with_citations(question, documents, model="claude-3-5-sonnet-latest", wi
     )
 
     if with_raw_response:
-        print("\n================================================================================")
-        print("Raw response:")
-        print("================================================================================")
+        print("=" * 80)
+        print("Raw Response:\n" + "=" * 80)
         print(raw_response(response))
-
-        print("================================================================================")
-        print("Formatted Response:")
-        print("================================================================================")
+        print("\n" + "=" * 80)
+        print("Formatted Response:\n" + "=" * 80)
 
     return print_annotated_response(response, index_to_title)
 
-# Function to format the raw response
-def raw_response(response):
+# Function to format the raw response only for debugging
+def raw_response(response: anthropic.types.Message) -> str:
     raw_blocks = []
     for block in response.content:
         if block.type == "text":
@@ -175,43 +166,45 @@ def raw_response(response):
     return json.dumps({"content": raw_blocks}, indent=2)
 
 # Function to print the annotated response
-def print_annotated_response(response, index_to_title=None):
+def print_annotated_response(
+    response: anthropic.types.Message,
+    index_to_title: Optional[Dict[int, str]] = None
+) -> None:
     """
-    Reconstruct the answer and citations dynamically from Claude's response.
+    Reconstructs and prints Claude's response with inline citations and supporting quotes.
     """
     answer = ""
     citation_bank = []
-    citation_map = {}
 
     for block in response.content:
         if block.type == "text":
             text = block.text.strip()
             refs = getattr(block, "citations", [])
-
             if refs:
-                # Create a new citation number
                 ref_number = len(citation_bank) + 1
                 citation_bank.append(refs)
-                citation_map[id(refs[0])] = ref_number
                 answer += f"{text} [{ref_number}] "
             else:
                 answer += f"{text} "
 
-    print("Answer :\n" + answer.strip())
+    print("Answer:\n" + answer.strip())
 
     if citation_bank:
-        print("\nQuotes :")
+        print("\nQuotes:")
         for i, ref_group in enumerate(citation_bank, 1):
             for ref in ref_group:
                 ref_dict = ref.dict() if hasattr(ref, "dict") else ref
                 cited_text = ref_dict.get("cited_text", "—").strip()
-                title = ref_dict.get("document", {}).get("title")
-
-                if not title and index_to_title and "document_index" in ref_dict:
-                    title = index_to_title.get(ref_dict["document_index"], "Unknown")
-
+                title = (
+                    ref_dict.get("document_title")
+                    or ref_dict.get("document", {}).get("title")
+                    or (
+                        index_to_title.get(ref_dict.get("document_index"))
+                        if index_to_title and "document_index" in ref_dict
+                        else "Unknown"
+                    )
+                )
                 print(f"[{i}] \"{cited_text}\" – {title}")
 
     print(f"\n🔢 Tokens used: input={response.usage.input_tokens}, output={response.usage.output_tokens}")
-
 
